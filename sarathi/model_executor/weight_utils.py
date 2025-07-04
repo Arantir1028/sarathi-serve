@@ -105,6 +105,7 @@ def prepare_hf_model_weights(
                 cache_dir=cache_dir,
                 tqdm_class=Disabledtqdm,
                 revision=revision,
+                resume_download=True,
             )
     else:
         hf_folder = model_name_or_path

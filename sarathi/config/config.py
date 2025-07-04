@@ -171,7 +171,8 @@ class ParallelConfig:
     )
 
     def __post_init__(self):
-        self.world_size = self.pipeline_parallel_size * self.tensor_parallel_size
+        # self.world_size = self.pipeline_parallel_size * self.tensor_parallel_size
+        self.world_size = int(self.pipeline_parallel_size * 1/2) * self.tensor_parallel_size
 
 
 @dataclass

@@ -30,12 +30,14 @@ replica_config = ReplicaConfig(
 )
 
 model_config = ModelConfig(
-    model="mistralai/Mixtral-8x7B-Instruct-v0.1",
+    # model="mistralai/Mixtral-8x7B-Instruct-v0.1",
+    model="mistralai/Mistral-7B-Instruct-v0.2",
 )
 
 parallel_config = ParallelConfig(
     tensor_parallel_size=1,
-    pipeline_parallel_size=4,
+    pipeline_parallel_size=2,
+    # pipeline_parallel_size=1,
 )
 
 scheduler_config = SarathiSchedulerConfig(
