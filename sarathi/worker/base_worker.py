@@ -1,3 +1,5 @@
+# edit
+
 """A GPU worker class."""
 
 import os
@@ -60,6 +62,8 @@ class BaseWorker:
         # Sequence manager also needs number of blocks for initialization
         self.seq_manager = None
 
+        self._init_device()  # 新增方法
+        
         self._verify_parallel_config()
         self.metrics_store = MetricsStore.get_or_create_instance(
             config.replica_config,
@@ -71,6 +75,12 @@ class BaseWorker:
 
         self.worker_ready_event = Event()
         self.execution_thread = Thread(target=self._execution_loop, daemon=True)
+
+    def _init_device(self):
+        """独立的设备初始化方法"""
+        self.device = torch.device(f"cuda:{self.local_rank}")
+        torch.cuda.set_device(self.device)
+        logger.info(f"Worker {self.rank} device initialized: {self.device}")
 
     def _init_zmq_sockets(self):
         self.zmq_context = zmq.Context()
@@ -102,9 +112,9 @@ class BaseWorker:
         # This env var set by Ray causes exceptions with graph building.
         os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
 
-        logger.info(f"Worker {self.rank} is using device {self.local_rank}")
-        self.device = torch.device(f"cuda:{self.local_rank}")
-        torch.cuda.set_device(self.device)
+        # logger.info(f"Worker {self.rank} is using device {self.local_rank}")
+        # self.device = torch.device(f"cuda:{self.local_rank}")
+        # torch.cuda.set_device(self.device)
 
         # Initialize the distributed environment.
         _init_distributed_environment(
@@ -280,6 +290,12 @@ def _init_distributed_environment(
 
     # A small all_reduce for warmup.
     torch.distributed.all_reduce(torch.zeros(1).cuda())
-    initialize_model_parallel(
-        parallel_config.tensor_parallel_size, parallel_config.pipeline_parallel_size
-    )
+    
+    if parallel_config.tensor_parallel_size == 1 and parallel_config.pipeline_parallel_size == 2:  # 写死了，感觉这东西很难超过2
+        initialize_model_parallel(
+            parallel_config.tensor_parallel_size, int(parallel_config.pipeline_parallel_size / 2)
+        )
+    else:
+        initialize_model_parallel(
+            parallel_config.tensor_parallel_size, parallel_config.pipeline_parallel_size
+        )

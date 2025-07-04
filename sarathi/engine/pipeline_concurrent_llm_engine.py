@@ -57,6 +57,16 @@ class PipelineConcurrentLLMEngine(BaseLLMEngine):
         self.schedule_event.set()
         self.schedule_thread.start()
         self.output_thread.start()
+    
+    def _get_worker_impl(self):
+        # if (self.config.parallel_config.pipeline_parallel_size >= 2 and 
+        #     self.config.parallel_config.tensor_parallel_size == 1):
+        from sarathi.worker.pipeline_concurrent_worker import PipelineConcurrentWorker
+        
+        return PipelineConcurrentWorker
+        # else:
+        #     from sarathi.worker.base_worker import BaseWorker
+        #     return BaseWorker
 
     @exit_on_error
     def _schedule_loop(self) -> None:
@@ -138,3 +148,4 @@ class PipelineConcurrentLLMEngine(BaseLLMEngine):
             return self.output_queue.get(block=False)
         except Empty:
             return []
+    

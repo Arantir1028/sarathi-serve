@@ -133,10 +133,14 @@ class BaseLLMEngine:
 
         return BaseWorker
 
+    
     def _init_workers_ray(self, **ray_remote_kwargs):
         resource_mapping = self.config.replica_config.get_resource_mapping(
             self.config.parallel_config.world_size
         )
+        is_concurrent = (self.config.parallel_config.pipeline_parallel_size == 2 and 
+                self.config.parallel_config.tensor_parallel_size == 1)
+
         logger.info(f"Starting workers with resource mapping: {resource_mapping}")
 
         self.workers: List[RayWorker] = []

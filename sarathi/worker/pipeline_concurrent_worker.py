@@ -35,8 +35,10 @@ class PipelineConcurrentWorker(BaseWorker):
         config: SystemConfig,
         local_rank: int,
         rank: int,
+        comm_info,
     ) -> None:
-        super().__init__(config, local_rank, rank)
+
+        super().__init__(config, local_rank, rank, comm_info)
         
         # 初始化多Stream
         self.streams = [
