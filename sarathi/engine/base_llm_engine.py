@@ -252,11 +252,13 @@ class BaseLLMEngine:
     def _on_step_completed(
         self,
         scheduler_outputs: SchedulerOutputs,
-        ignored_seqs: List[SequenceMetadata],
+        ignored_seqs: List[Sequence],  # 修正类型
         seq_metadata_list: List[SequenceMetadata],
         sampler_outputs: Optional[SamplerOutputs],
         start_time: float,
     ) -> List[RequestOutput]:
+        if sampler_outputs is None:
+            return []
         with self._process_model_outputs_timer:
             self.seq_manager.on_step_completed(
                 scheduler_outputs,

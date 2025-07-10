@@ -4,6 +4,8 @@ from typing import Tuple, Optional
 import torch
 import torch.distributed
 import zmq
+import threading
+import queue
 
 from sarathi.config import CacheConfig
 from sarathi.core.datatypes.scheduler_output import SchedulerOutputs
@@ -220,107 +222,136 @@ class PipelineConcurrentWorker(BaseWorker):
     ) -> None:
         self.seq_manager.on_step_completed(scheduler_outputs, sampler_outputs)
 
-    @exit_on_error
-    def _execution_loop(self) -> None:
-        torch.cuda.set_device(self.device)
-        self.worker_ready_event.set()
-        while True:
-            step_inputs = self.enqueue_socket.recv_pyobj()
-            for new_seq in step_inputs.new_seqs:
-                self.seq_manager.add_seq(new_seq)
-            for pending_step_output in getattr(step_inputs, 'pending_step_outputs', []):
-                self.seq_manager.on_step_completed(
-                    pending_step_output[0], pending_step_output[1]
-                )
-            output = self.execute_model(step_inputs.scheduler_outputs)
-            if not self.is_tensor_parallel_rank_zero:
-                continue
-            if self.is_last_pipeline_stage:
-                self.output_socket.send_pyobj(output)
-            elif self.is_first_pipeline_stage:
-                self.microbatch_socket.send_pyobj(None)
+    def _split_layers(self):
+        # 适配Mistral模型，假设self.model_runner.model.model.layers为nn.ModuleList
+        all_layers = list(self.model_runner.model.model.layers)
+        num_stages = self.config.parallel_config.pipeline_parallel_size
+        layers_per_stage = len(all_layers) // num_stages
+        stage_layers = []
+        for i in range(num_stages):
+            start = i * layers_per_stage
+            end = (i + 1) * layers_per_stage if i < num_stages - 1 else len(all_layers)
+            stage_layers.append(all_layers[start:end])
+        return stage_layers
 
-    @synchronized
-    def get_model_parallel_ranks(self) -> Tuple[int, int]:
-        return self.tensor_model_parallel_rank, self.pipeline_model_parallel_rank 
+    def pipeline_inference(self, input_tensor, positions, attention_backend_wrapper):
+        num_stages = self.config.parallel_config.pipeline_parallel_size
+        device = self.device
+        stage_layers = self._split_layers()
+        streams = [torch.cuda.Stream() for _ in range(num_stages)]
+        queues = [queue.Queue() for _ in range(num_stages + 1)]
+        threads = []
+
+        def stage_worker(stage_id, input_queue, output_queue, layers, stream):
+            torch.cuda.set_device(device)
+            while True:
+                x = input_queue.get()
+                if x is None:
+                    output_queue.put(None)
+                    break
+                with torch.cuda.stream(stream):
+                    for idx, layer in enumerate(layers):
+                        global_layer_id = stage_id * len(layers) + idx
+                        # 只保留最小必要的shape/dtype修正
+                        if isinstance(x, torch.Tensor):
+                            if x.dim() == 1:
+                                x = x.unsqueeze(0)
+                            if x.dtype != torch.float16:
+                                x = x.to(dtype=torch.float16)
+                        x = layer(positions, x, global_layer_id, attention_backend_wrapper)
+                output_queue.put(x)
+
+        for i in range(num_stages):
+            t = threading.Thread(target=stage_worker, args=(i, queues[i], queues[i+1], stage_layers[i], streams[i]))
+            t.start()
+            threads.append(t)
+
+        if isinstance(input_tensor, torch.Tensor):
+            if input_tensor.dim() == 1:
+                input_tensor = input_tensor.unsqueeze(0)
+            if input_tensor.dtype != torch.float16:
+                input_tensor = input_tensor.to(dtype=torch.float16)
+        queues[0].put(input_tensor)
+        queues[0].put(None)
+
+        result = None
+        while True:
+            out = queues[-1].get()
+            if out is None:
+                break
+            result = out
+
+        for t in threads:
+            t.join()
+        return result
 
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_outputs: SchedulerOutputs,
     ) -> Optional[SamplerOutputs]:
-        """在pipeline_concurrent模式下执行模型"""
         torch.cuda.synchronize()
         batch_stage_start_time = time.monotonic()
-
-        _, seq_metadata_list = self.seq_manager.on_schedule(scheduler_outputs)
-
-        # 在pipeline_concurrent模式下，模型的前向传播会通过send/recv函数在内存中传递数据
-        # 只有最后一个stage才需要返回采样输出
-        if self.is_last_pipeline_stage:
-            # 确保sampler存在且seq_metadata_list不为空
-            if self.model_runner.sampler is None:
-                # 再次尝试修复sampler
-                from sarathi.model_executor.layers.sampler import Sampler
-                if hasattr(self.model_runner.model, 'lm_head') and self.model_runner.model.lm_head is not None:
-                    self.model_runner.sampler = Sampler(
-                        self.model_runner.model.lm_head.weight, 
-                        self.model_runner.model.config.vocab_size
-                    )
-                else:
-                    # 创建空的SamplerOutputs作为fallback
-                    from sarathi.core.datatypes.sequence import SamplerOutput
-                    output = []
-                    for seq_metadata in seq_metadata_list:
-                        sampler_output = SamplerOutput(
-                            seq_id=seq_metadata.seq.seq_id,
-                            output_token=0  # 占位符token
-                        )
-                        output.append(sampler_output)
-                    return output
-            
-            # 正常执行模型推理和采样
-            output = self.model_runner.run(seq_metadata_list)
-            
-            # 确保output是SamplerOutputs类型
-            if not isinstance(output, list):
-                # 创建空的SamplerOutputs作为fallback
+        for seq_sched_metadata in scheduler_outputs.scheduled_seq_metadata_list:
+            seq_id = seq_sched_metadata.seq_id
+            seq = self.seq_manager.seq_map[seq_id]
+            if seq.is_waiting() or seq.is_paused():
+                self.seq_manager._resume_seq(seq_id)
+            if not hasattr(self.seq_manager.block_manager, 'block_tables') or seq_id not in self.seq_manager.block_manager.block_tables:
+                self.seq_manager.block_manager.allocate(seq)
+        seq_metadata_list = []
+        from sarathi.core.datatypes.sequence import SequenceMetadata
+        for seq_sched_metadata in scheduler_outputs.scheduled_seq_metadata_list:
+            seq = self.seq_manager.seq_map[seq_sched_metadata.seq_id]
+            block_table = self.seq_manager._get_block_table(seq)
+            seq_metadata_list.append(
+                SequenceMetadata(
+                    seq,
+                    block_table,
+                    seq_sched_metadata.num_prompt_tokens,
+                )
+            )
+        outputs = []
+        if not self.is_last_pipeline_stage:
+            return None
+        outputs = []
+        for seq_metadata in seq_metadata_list:
+            input_tokens, input_positions = self.model_runner._prepare_inputs([seq_metadata])
+            self.model_runner.attention_backend_wrapper.begin_forward([seq_metadata])
+            if hasattr(self.model_runner.model.model, 'embed_tokens') and input_tokens.dtype in (torch.int32, torch.int64):
+                if input_tokens.dim() == 2 and input_tokens.shape[0] == 1:
+                    input_tokens = input_tokens.squeeze(0)
+                hidden_states = self.model_runner.model.model.embed_tokens(input_tokens)
+                if hidden_states.dim() == 3 and hidden_states.shape[0] == 1:
+                    hidden_states = hidden_states.squeeze(0)
+            else:
+                hidden_states = input_tokens
+            hidden_states = self.pipeline_inference(hidden_states, input_positions, self.model_runner.attention_backend_wrapper)
+            self.model_runner.attention_backend_wrapper.end_forward()
+            if self.model_runner.sampler is not None:
+                sampler_output = self.model_runner.sampler(hidden_states, [seq_metadata])
+                if isinstance(sampler_output, list):
+                    outputs.extend(sampler_output)
+                elif sampler_output is not None:
+                    outputs.append(sampler_output)
+            else:
                 from sarathi.core.datatypes.sequence import SamplerOutput
-                output = []
-                for seq_metadata in seq_metadata_list:
-                    sampler_output = SamplerOutput(
-                        seq_id=seq_metadata.seq.seq_id,
-                        output_token=0  # 占位符token
-                    )
-                    output.append(sampler_output)
-        else:
-            # 非最后一个stage只执行前向传播，不进行采样
-            # 临时禁用sampler，让模型只执行前向传播
-            original_sampler = self.model_runner.sampler
-            self.model_runner.sampler = None
-            
-            try:
-                # 这里会返回torch.Tensor，但我们不需要它
-                self.model_runner.run(seq_metadata_list)
-                output = None
-            finally:
-                # 恢复sampler
-                self.model_runner.sampler = original_sampler
+                outputs.append(SamplerOutput(seq_id=seq_metadata.seq.seq_id, output_token=0))
+        return outputs
 
-        # 在pipeline_concurrent模式下，我们不需要调用on_step_completed
-        # 因为每个stage只处理部分计算，最终的序列管理由engine处理
+    @synchronized
+    def get_model_parallel_ranks(self) -> Tuple[int, int]:
+        return self.tensor_model_parallel_rank, self.pipeline_model_parallel_rank 
 
-        torch.cuda.synchronize()
-
-        batch_stage_end_time = time.monotonic()
-
-        self.metrics_store.on_batch_stage_end(
-            seq_metadata_list,
-            scheduler_outputs,
-            self.tensor_model_parallel_rank,
-            self.pipeline_model_parallel_rank,
-            batch_stage_start_time,
-            batch_stage_end_time,
-        )
-
-        return output 
+    def _execution_loop(self) -> None:
+        import torch
+        torch.cuda.set_device(self.device)
+        self.worker_ready_event.set()
+        while True:
+            step_inputs = self.enqueue_socket.recv_pyobj()
+            for new_seq in step_inputs.new_seqs:
+                self.seq_manager.add_seq(new_seq)
+            output = self.execute_model(step_inputs.scheduler_outputs)
+            # 只让最后一个 stage 发送 output，其余 stage 不发送
+            if self.is_last_pipeline_stage:
+                self.output_socket.send_pyobj(output)
