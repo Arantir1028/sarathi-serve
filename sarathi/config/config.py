@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from sarathi.config.base_poly_config import BasePolyConfig
 from sarathi.config.flat_dataclass import create_flat_dataclass
@@ -344,6 +344,47 @@ class WorkerConfig:
         default=AttentionBackend.FLASHINFER,
         metadata={"help": "Backend to use for attention computation."},
     )
+    force_concurrent: bool = field(
+        default=False,
+        metadata={"help": "If True, force single-GPU pipeline-concurrent mode (all stages on one GPU)."}
+    )
+    # 资源分配策略配置
+    resource_allocation_strategy: str = field(
+        default="layer_based",
+        metadata={"help": "Resource allocation strategy for pipeline_concurrent mode: 'layer_based', 'performance_based', 'adaptive', 'equal'."}
+    )
+    # 缓存分配相关（向后兼容）
+    cache_allocation_strategy: str = field(
+        default="layer_based",
+        metadata={"help": "Cache allocation strategy (deprecated, use resource_allocation_strategy instead)."}
+    )
+    cache_allocation_weights: Optional[List[float]] = field(
+        default=None,
+        metadata={"help": "Custom weights for weighted cache allocation strategy."}
+    )
+    # 算力分配相关
+    compute_allocation_weights: Optional[List[float]] = field(
+        default=None,
+        metadata={"help": "Custom weights for compute resource allocation strategy."}
+    )
+    # 资源分配权重
+    cache_weight: float = field(
+        default=0.6,
+        metadata={"help": "Weight for cache allocation in layer_based strategy (0.0 to 1.0)."}
+    )
+    compute_weight: float = field(
+        default=0.4,
+        metadata={"help": "Weight for compute allocation in layer_based strategy (0.0 to 1.0)."}
+    )
+    # 算力资源相关
+    compute_utilization: float = field(
+        default=0.8,
+        metadata={"help": "Compute resource utilization fraction (0.0 to 1.0)."}
+    )
+    enable_dynamic_compute_allocation: bool = field(
+        default=True,
+        metadata={"help": "Enable dynamic compute resource allocation based on workload."}
+    )
 
     def __post_init__(self):
         self._verify_args()
@@ -353,6 +394,16 @@ class WorkerConfig:
             raise ValueError(
                 "GPU memory utilization must be less than 1.0. Got "
                 f"{self.gpu_memory_utilization}."
+            )
+        if self.compute_utilization > 1.0:
+            raise ValueError(
+                "Compute utilization must be less than 1.0. Got "
+                f"{self.compute_utilization}."
+            )
+        if self.cache_weight + self.compute_weight > 1.0:
+            raise ValueError(
+                f"Cache weight ({self.cache_weight}) + compute weight ({self.compute_weight}) "
+                "must be less than or equal to 1.0."
             )
 
 

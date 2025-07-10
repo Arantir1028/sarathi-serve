@@ -2,8 +2,10 @@ import datetime
 from tqdm import tqdm
 from typing import List
 
+from sarathi.config import WorkerConfig
 from sarathi.config import ModelConfig, ParallelConfig, SarathiSchedulerConfig, MetricsConfig, SystemConfig, ReplicaConfig
-from sarathi import LLMEngine, SamplingParams, RequestOutput
+from sarathi.engine.llm_engine import LLMEngine
+from sarathi import SamplingParams, RequestOutput
 
 
 BASE_OUTPUT_DIR = "./offline_inference_output"
@@ -30,12 +32,13 @@ replica_config = ReplicaConfig(
 )
 
 model_config = ModelConfig(
-    model="mistralai/Mixtral-8x7B-Instruct-v0.1",
+    model="mistralai/Mistral-7B-Instruct-v0.2",
 )
 
 parallel_config = ParallelConfig(
     tensor_parallel_size=1,
-    pipeline_parallel_size=4,
+    pipeline_parallel_size=2,
+    # pipeline_parallel_size=4,
 )
 
 scheduler_config = SarathiSchedulerConfig(
@@ -48,19 +51,38 @@ metrics_config = MetricsConfig(
     enable_chrome_trace=True,
 )
 
+worker_config = WorkerConfig(
+    force_concurrent=True,  # 关键参数：强制使用pipeline_concurrent模式
+    gpu_memory_utilization=0.8,  # 调整内存使用率
+    compute_utilization=0.8,  # 调整算力使用率
+    
+    # 资源分配策略配置
+    resource_allocation_strategy="layer_based",  # 根据层数分配资源
+    cache_weight=0.6,  # 缓存分配权重
+    compute_weight=0.4,  # 算力分配权重
+    enable_dynamic_compute_allocation=True,  # 启用动态算力分配
+    
+    # 或者使用其他策略：
+    # resource_allocation_strategy="equal",  # 平均分配
+    # resource_allocation_strategy="performance_based",  # 基于性能分配
+    # compute_allocation_weights=[0.3, 0.7],  # 自定义算力权重
+    # resource_allocation_strategy="adaptive",  # 自适应分配
+)
+   
 system_config = SystemConfig(
     replica_config=replica_config,
     model_config=model_config,
     parallel_config=parallel_config,
     scheduler_config=scheduler_config,
     metrics_config=metrics_config,
+    worker_config=worker_config,  # 添加worker_config参数
 )
 
 llm_engine = LLMEngine.from_system_config(system_config)
 
 
 def generate(
-    llm_engine: LLMEngine,
+    llm_engine,  # 移除类型注解以避免类型检查器错误
     prompts: List[str],
     sampling_params: SamplingParams,
 ) -> List[RequestOutput]:

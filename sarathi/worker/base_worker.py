@@ -247,6 +247,20 @@ class BaseWorker:
         return self.model_runner.profile_num_available_blocks(
             block_size, gpu_memory_utilization
         )
+    
+    @synchronized
+    def profile_compute_resources(self, compute_utilization: float) -> int:
+        """分析可用的算力资源"""
+        # 获取GPU的SM数量作为算力单位
+        if torch.cuda.is_available():
+            device_properties = torch.cuda.get_device_properties(self.device)
+            total_sms = device_properties.multi_processor_count
+            available_sms = int(total_sms * compute_utilization)
+            logger.info(f"Worker {self.rank} compute resources: {available_sms} SMs (total: {total_sms})")
+            return available_sms
+        else:
+            logger.warning("CUDA not available, using default compute units")
+            return 1
 
     @synchronized
     def stop_profiling(self) -> None:

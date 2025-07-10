@@ -207,19 +207,14 @@ class BaseLLMEngine:
 
     def _init_cache(self) -> None:
         """Profiles the memory usage and initializes the KV cache."""
-        # Get the maximum number of blocks that can be allocated on GPU.
+        # 原有逻辑 - 适用于base和parallel方法
         num_gpu_blocks_across_workers = self._run_workers(
             "profile_num_available_blocks",
             get_all_outputs=True,
             block_size=self.config.cache_config.block_size,
             gpu_memory_utilization=self.config.worker_config.gpu_memory_utilization,
         )
-
-        # Since we use a shared centralized controller, we take the minimum
-        # number of blocks across all workers to make sure all the memory
-        # operators can be applied to all workers.
         num_gpu_blocks = min(num_gpu_blocks_across_workers)
-        # FIXME(woosuk): Change to debug log.
         logger.info(f"# GPU blocks: {num_gpu_blocks}")
 
         if num_gpu_blocks <= 0:
@@ -235,7 +230,7 @@ class BaseLLMEngine:
             raise ValueError(
                 f"Not enough available memory to schedule a request will maximum allowed length {self.config.model_config.max_model_len}. "
                 f"Need {max_blocks_per_request}, available {num_gpu_blocks} gpu blocks. "
-                f"Try decreasing `max_batch_size`, `max_model_len`."
+                "Try decreasing `max_batch_size`, `max_model_len`."
             )
         self.config.cache_config.num_gpu_blocks = num_gpu_blocks
 
