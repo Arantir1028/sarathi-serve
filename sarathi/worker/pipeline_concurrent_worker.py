@@ -28,29 +28,11 @@ class PipelineConcurrentWorker(BaseWorker):
         self.device = torch.device("cuda:0")
         torch.cuda.set_device(self.device)
         
-        # 在pipeline_concurrent模式下，我们需要避免NCCL的GPU重复检测
-        # 因此我们跳过分布式环境的初始化，直接初始化模型
-        
         # 设置环境变量避免NCCL问题
         os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
         os.environ["KINETO_LOG_LEVEL"] = "5"
         os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
-        
-        # 设置pipeline_concurrent模式标志
         os.environ["PIPELINE_CONCURRENT_MODE"] = "1"
-        
-        # 在pipeline_concurrent模式下，send和recv函数会通过环境变量检测并跳过通信
-        
-        # 直接设置模型并行rank，避免分布式初始化
-        self.tensor_model_parallel_rank = 0  # 所有worker都是tensor rank 0
-        self.pipeline_model_parallel_rank = self.rank  # pipeline rank就是worker rank
-        
-        self.is_tensor_parallel_rank_zero = True
-        self.is_first_pipeline_stage = self.pipeline_model_parallel_rank == 0
-        self.is_last_pipeline_stage = (
-            self.pipeline_model_parallel_rank
-            == self.config.parallel_config.pipeline_parallel_size - 1
-        )
         
         # 手动设置parallel_state模块的全局变量，避免依赖分布式环境
         from sarathi.model_executor.parallel_utils.parallel_state import (
@@ -61,97 +43,101 @@ class PipelineConcurrentWorker(BaseWorker):
         )
         
         # 设置tensor parallel相关
-        set_tensor_model_parallel_rank(self.tensor_model_parallel_rank)
+        set_tensor_model_parallel_rank(0)
         set_tensor_model_parallel_world_size(self.config.parallel_config.tensor_parallel_size)
         
-        # 设置pipeline parallel相关
-        set_pipeline_model_parallel_rank(self.pipeline_model_parallel_rank)
-        set_pipeline_model_parallel_world_size(self.config.parallel_config.pipeline_parallel_size)
+        # 记录原始pipeline配置
+        original_pp_size = self.config.parallel_config.pipeline_parallel_size
+        original_pp_rank = self.rank
         
-        # 创建假的分布式组来满足parallel_state模块的要求
-        # 在pipeline_concurrent模式下，所有worker都在同一块GPU上，所以这些组实际上不需要通信
-        import torch.distributed
+        # 临时patch pipeline config，保证权重加载完整
+        self.config.parallel_config.pipeline_parallel_size = 1
+        set_pipeline_model_parallel_world_size(1)
+        set_pipeline_model_parallel_rank(0)
         
-        # 创建一个假的pipeline group，包含所有pipeline ranks
-        pipeline_ranks = list(range(self.config.parallel_config.pipeline_parallel_size))
-        
-        # 直接设置全局变量，避免调用torch.distributed.new_group
-        import sarathi.model_executor.parallel_utils.parallel_state as parallel_state
-        
-        # 设置pipeline group
-        parallel_state._PIPELINE_MODEL_PARALLEL_GROUP = type('FakeGroup', (), {
-            'size': lambda *args: self.config.parallel_config.pipeline_parallel_size,
-            'rank': lambda *args: self.pipeline_model_parallel_rank,
-        })()
-        parallel_state._PIPELINE_GLOBAL_RANKS = pipeline_ranks
-        
-        # 设置tensor group
-        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = type('FakeGroup', (), {
-            'size': lambda *args: self.config.parallel_config.tensor_parallel_size,
-            'rank': lambda *args: self.tensor_model_parallel_rank,
-        })()
-        
-        # 设置data parallel group
-        parallel_state._DATA_PARALLEL_GROUP = type('FakeGroup', (), {
-            'size': lambda *args: 1,  # 在pipeline_concurrent模式下，data parallel size = 1
-            'rank': lambda *args: 0,
-        })()
-        parallel_state._DATA_PARALLEL_GLOBAL_RANKS = [0]
-        
-        # 设置model parallel group
-        parallel_state._MODEL_PARALLEL_GROUP = type('FakeGroup', (), {
-            'size': lambda *args: self.config.parallel_config.world_size,
-            'rank': lambda *args: self.rank,
-        })()
-        
-        # 设置embedding group
-        parallel_state._EMBEDDING_GROUP = type('FakeGroup', (), {
-            'size': lambda *args: 1,
-            'rank': lambda *args: 0,
-        })()
-        parallel_state._EMBEDDING_GLOBAL_RANKS = [0]
-        
-        # 设置position embedding group
-        parallel_state._POSITION_EMBEDDING_GROUP = type('FakeGroup', (), {
-            'size': lambda *args: 1,
-            'rank': lambda *args: 0,
-        })()
-        parallel_state._POSITION_EMBEDDING_GLOBAL_RANKS = [0]
-        
-        # 在pipeline_concurrent模式下，我们需要特殊处理模型初始化
-        # 让所有worker都加载完整的模型，而不是只加载部分层
+        # 初始化模型并加载完整权重
         from sarathi.model_executor import set_random_seed
         from sarathi.model_executor.model_runner import ModelRunner
-        
         set_random_seed(self.config.model_config.seed)
-        
-        # 在pipeline_concurrent模式下，直接初始化模型
         self.model_runner = ModelRunner(
             self.config,
             self.device,
             self.rank,
         )
         
-        # 在pipeline_concurrent模式下，确保最后一个stage有sampler
+        # 恢复原始pipeline配置
+        self.config.parallel_config.pipeline_parallel_size = original_pp_size
+        set_pipeline_model_parallel_world_size(original_pp_size)
+        set_pipeline_model_parallel_rank(original_pp_rank)
+
+        # 重新设置本地rank属性
+        self.tensor_model_parallel_rank = 0
+        self.pipeline_model_parallel_rank = self.rank
+        self.is_tensor_parallel_rank_zero = True
+        self.is_first_pipeline_stage = self.pipeline_model_parallel_rank == 0
+        self.is_last_pipeline_stage = (
+            self.pipeline_model_parallel_rank
+            == self.config.parallel_config.pipeline_parallel_size - 1
+        )
+        
+        # 伪造分布式组（保持原有逻辑）
+        pipeline_ranks = list(range(self.config.parallel_config.pipeline_parallel_size))
+        import sarathi.model_executor.parallel_utils.parallel_state as parallel_state
+        parallel_state._PIPELINE_MODEL_PARALLEL_GROUP = type('FakeGroup', (), {
+            'size': lambda *args: self.config.parallel_config.pipeline_parallel_size,
+            'rank': lambda *args: self.pipeline_model_parallel_rank,
+        })()
+        parallel_state._PIPELINE_GLOBAL_RANKS = pipeline_ranks
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = type('FakeGroup', (), {
+            'size': lambda *args: self.config.parallel_config.tensor_parallel_size,
+            'rank': lambda *args: self.tensor_model_parallel_rank,
+        })()
+        parallel_state._DATA_PARALLEL_GROUP = type('FakeGroup', (), {
+            'size': lambda *args: 1,
+            'rank': lambda *args: 0,
+        })()
+        parallel_state._DATA_PARALLEL_GLOBAL_RANKS = [0]
+        parallel_state._MODEL_PARALLEL_GROUP = type('FakeGroup', (), {
+            'size': lambda *args: self.config.parallel_config.world_size,
+            'rank': lambda *args: self.rank,
+        })()
+        parallel_state._EMBEDDING_GROUP = type('FakeGroup', (), {
+            'size': lambda *args: 1,
+            'rank': lambda *args: 0,
+        })()
+        parallel_state._EMBEDDING_GLOBAL_RANKS = [0]
+        parallel_state._POSITION_EMBEDDING_GROUP = type('FakeGroup', (), {
+            'size': lambda *args: 1,
+            'rank': lambda *args: 0,
+        })()
+        parallel_state._POSITION_EMBEDDING_GLOBAL_RANKS = [0]
+        
+        # sampler/lm_head初始化逻辑保持不变
         if self.is_last_pipeline_stage:
-            # 检查sampler是否被正确初始化
             if self.model_runner.sampler is None:
-                # 手动创建sampler
                 from sarathi.model_executor.layers.sampler import Sampler
                 if hasattr(self.model_runner.model, 'lm_head') and self.model_runner.model.lm_head is not None:
+                    from sarathi.model_executor.weight_utils import load_padded_tensor_parallel_vocab, hf_model_weights_iterator
+                    from sarathi.model_executor.parallel_utils.parallel_state import get_tensor_model_parallel_rank
+                    tp_rank = get_tensor_model_parallel_rank()
+                    for name, loaded_weight in hf_model_weights_iterator(
+                        self.config.model_config.model,
+                        self.config.model_config.download_dir,
+                        self.config.model_config.load_format,
+                        self.config.model_config.revision,
+                    ):
+                        if "lm_head" in name:
+                            param = self.model_runner.model.state_dict()[name]
+                            load_padded_tensor_parallel_vocab(param, loaded_weight, tp_rank)
+                            break
                     self.model_runner.sampler = Sampler(
                         self.model_runner.model.lm_head.weight, 
                         self.model_runner.model.config.vocab_size
                     )
                 else:
-                    # 如果lm_head不存在，我们需要手动创建它
                     from sarathi.model_executor.parallel_utils.tensor_parallel import ColumnParallelLinear
-                    
-                    # 获取vocab_size
                     vocab_size = self.model_runner.model.config.vocab_size
-                    vocab_size = ((vocab_size + 63) // 64) * 64  # 对齐到64的倍数
-                    
-                    # 创建lm_head
+                    vocab_size = ((vocab_size + 63) // 64) * 64
                     self.model_runner.model.lm_head = ColumnParallelLinear(
                         self.model_runner.model.config.hidden_size,
                         vocab_size,
@@ -159,14 +145,11 @@ class PipelineConcurrentWorker(BaseWorker):
                         gather_output=False,
                         perform_initialization=False,
                     )
-                    
-                    # 现在创建sampler
                     self.model_runner.sampler = Sampler(
                         self.model_runner.model.lm_head.weight, 
                         self.model_runner.model.config.vocab_size
                     )
         else:
-            # 非最后一个stage不需要sampler
             self.model_runner.sampler = None
     
     @torch.inference_mode()
